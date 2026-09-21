@@ -1,0 +1,73 @@
+name: 05 - Deploy Monitoring
+
+on:
+  workflow_run:
+    workflows:
+      - "02 - Deploy to Staging"
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy-monitoring:
+    name: Deploy Prometheus & Grafana
+    runs-on: ubuntu-latest
+
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    environment:
+      name: staging
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Add Helm repositories
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Create monitoring namespace
+        run: |
+          kubectl create namespace monitoring \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Deploy kube-prometheus-stack
+        run: |
+          helm upgrade --install kube-prometheus-stack \
+            prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --set grafana.service.type=LoadBalancer \
+            --set prometheus.service.type=ClusterIP \
+            --wait --timeout 10m
+
+      - name: Apply ServiceMonitor for user-service
+        run: |
+          kubectl apply -f kubernetes/monitoring/user-service-servicemonitor.yaml
+
+      - name: Validate monitoring stack
+        run: |
+          kubectl get pods -n monitoring
+          kubectl get servicemonitors -n monitoring
+          kubectl rollout status deployment/kube-prometheus-stack-operator \
+            -n monitoring --timeout=180s
